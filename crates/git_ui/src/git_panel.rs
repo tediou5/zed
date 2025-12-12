@@ -639,6 +639,7 @@ pub struct GitPanel {
     bulk_staging: Option<BulkStaging>,
     stash_entries: GitStash,
     optimistic_staging: HashMap<RepoPath, bool>,
+    tracked_commit_sha: Option<String>,
     _settings_subscription: Subscription,
 }
 
@@ -736,6 +737,38 @@ impl GitPanel {
                 }
             });
 
+            let workspace_entity = workspace.weak_handle().upgrade().expect("");
+            cx.subscribe_in(
+                &workspace_entity,
+                window,
+                move |this, workspace_entity, event, window, cx| match event {
+                    workspace::Event::ActiveItemChanged => {
+                        let Some(commit_view) =
+                            workspace_entity.read(cx).active_item_as::<CommitView>(cx)
+                        else {
+                            if this.tracked_commit_sha.take().is_some() {
+                                this.update_visible_entries(window, cx);
+                            }
+
+                            return;
+                        };
+
+                        let commit_sha = commit_view.read(cx).commit_sha();
+                        let Some(old) = this.tracked_commit_sha.replace(commit_sha.to_string())
+                        else {
+                            this.update_visible_entries(window, cx);
+                            return;
+                        };
+
+                        if old != commit_sha {
+                            this.update_visible_entries(window, cx);
+                        }
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
+
             cx.subscribe_in(
                 &git_store,
                 window,
@@ -809,6 +842,7 @@ impl GitPanel {
                 bulk_staging: None,
                 stash_entries: Default::default(),
                 optimistic_staging: HashMap::default(),
+                tracked_commit_sha: None,
                 _settings_subscription,
             };
 
@@ -1055,6 +1089,17 @@ impl GitPanel {
             let entry = self.entries.get(self.selected_entry?)?.status_entry()?;
             let workspace = self.workspace.upgrade()?;
             let git_repo = self.active_repository.as_ref()?;
+
+            if let Some(ref commit_sha) = self.tracked_commit_sha
+                && let Some(commit_view) = workspace.read(cx).active_item_as::<CommitView>(cx)
+                && commit_view.read(cx).commit_sha() == commit_sha
+            {
+                let repo_path = entry.repo_path.clone();
+                commit_view.update(cx, |commit_view, cx| {
+                    commit_view.focus_repo_path(&repo_path, window, cx);
+                });
+                return None;
+            }
 
             if let Some(project_diff) = workspace.read(cx).active_item_as::<ProjectDiff>(cx)
                 && let Some(project_path) = project_diff.read(cx).active_path(cx)
@@ -3203,6 +3248,7 @@ impl GitPanel {
     }
 
     fn update_visible_entries(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let from_commit = self.tracked_commit_sha.is_some();
         let path_style = self.project.read(cx).path_style(cx);
         let bulk_staging = self.bulk_staging.take();
         let last_staged_path_prev_index = bulk_staging
@@ -3226,12 +3272,6 @@ impl GitPanel {
         let sort_by_path = GitPanelSettings::get_global(cx).sort_by_path;
         let is_tree_view = matches!(self.view_mode, GitPanelViewMode::Tree(_));
         let group_by_status = is_tree_view || !sort_by_path;
-
-        let mut changed_entries = Vec::new();
-        let mut new_entries = Vec::new();
-        let mut conflict_entries = Vec::new();
-        let mut single_staged_entry = None;
-        let mut staged_count = 0;
         let mut seen_directories = HashSet::default();
         let mut max_width_estimate = 0usize;
         let mut max_width_item_index = None;
@@ -3244,70 +3284,26 @@ impl GitPanel {
 
         let repo = repo.read(cx);
 
-        self.stash_entries = repo.cached_stash();
+        let [mut changed_entries, mut new_entries, mut conflict_entries] = if from_commit
+            && let Some(commit_view) = self
+                .workspace
+                .upgrade()
+                .and_then(|ws| ws.read(cx).active_item_as::<CommitView>(cx))
+        {
+            let changed_entries = commit_view
+                .read(cx)
+                .cached_status()
+                .map(|entry| GitStatusEntry {
+                    repo_path: entry.repo_path.clone(),
+                    status: entry.status,
+                    staging: entry.status.staging(),
+                })
+                .collect::<Vec<_>>();
 
-        for entry in repo.cached_status() {
-            self.changes_count += 1;
-            let is_conflict = repo.had_conflict_on_last_merge_head_change(&entry.repo_path);
-            let is_new = entry.status.is_created();
-            let staging = entry.status.staging();
-
-            if let Some(pending) = repo.pending_ops_for_path(&entry.repo_path)
-                && pending
-                    .ops
-                    .iter()
-                    .any(|op| op.git_status == pending_op::GitStatus::Reverted && op.finished())
-            {
-                continue;
-            }
-
-            let entry = GitStatusEntry {
-                repo_path: entry.repo_path.clone(),
-                status: entry.status,
-                staging,
-            };
-
-            if staging.has_staged() {
-                staged_count += 1;
-                single_staged_entry = Some(entry.clone());
-            }
-
-            if group_by_status && is_conflict {
-                conflict_entries.push(entry);
-            } else if group_by_status && is_new {
-                new_entries.push(entry);
-            } else {
-                changed_entries.push(entry);
-            }
-        }
-
-        if conflict_entries.is_empty() {
-            if staged_count == 1
-                && let Some(entry) = single_staged_entry.as_ref()
-            {
-                if let Some(ops) = repo.pending_ops_for_path(&entry.repo_path) {
-                    if ops.staged() {
-                        self.single_staged_entry = single_staged_entry;
-                    }
-                } else {
-                    self.single_staged_entry = single_staged_entry;
-                }
-            } else if repo.pending_ops_summary().item_summary.staging_count == 1
-                && let Some(ops) = repo.pending_ops().find(|ops| ops.staging())
-            {
-                self.single_staged_entry =
-                    repo.status_for_path(&ops.repo_path)
-                        .map(|status| GitStatusEntry {
-                            repo_path: ops.repo_path.clone(),
-                            status: status.status,
-                            staging: StageStatus::Staged,
-                        });
-            }
-        }
-
-        if conflict_entries.is_empty() && changed_entries.len() == 1 {
-            self.single_tracked_entry = changed_entries.first().cloned();
-        }
+            [changed_entries, Vec::new(), Vec::new()]
+        } else {
+            self.collect_entries(repo, group_by_status)
+        };
 
         let mut push_entry =
             |this: &mut Self,
@@ -3435,14 +3431,96 @@ impl GitPanel {
 
         self.select_first_entry_if_none(cx);
 
-        let suggested_commit_message = self.suggest_commit_message(cx);
-        let placeholder_text = suggested_commit_message.unwrap_or("Enter commit message".into());
+        if !from_commit {
+            let suggested_commit_message = self.suggest_commit_message(cx);
+            let placeholder_text =
+                suggested_commit_message.unwrap_or("Enter commit message".into());
 
-        self.commit_editor.update(cx, |editor, cx| {
-            editor.set_placeholder_text(&placeholder_text, window, cx)
-        });
+            self.commit_editor.update(cx, |editor, cx| {
+                editor.set_placeholder_text(&placeholder_text, window, cx)
+            });
+        }
 
         cx.notify();
+    }
+
+    fn collect_entries(
+        &mut self,
+        repo: &Repository,
+        group_by_status: bool,
+    ) -> [Vec<GitStatusEntry>; 3] {
+        let mut changed_entries = Vec::new();
+        let mut new_entries = Vec::new();
+        let mut conflict_entries = Vec::new();
+        let mut single_staged_entry = None;
+        let mut staged_count = 0;
+
+        self.stash_entries = repo.cached_stash();
+
+        for entry in repo.cached_status() {
+            self.changes_count += 1;
+            let is_conflict = repo.had_conflict_on_last_merge_head_change(&entry.repo_path);
+            let is_new = entry.status.is_created();
+            let staging = entry.status.staging();
+
+            if let Some(pending) = repo.pending_ops_for_path(&entry.repo_path)
+                && pending
+                    .ops
+                    .iter()
+                    .any(|op| op.git_status == pending_op::GitStatus::Reverted && op.finished())
+            {
+                continue;
+            }
+
+            let entry = GitStatusEntry {
+                repo_path: entry.repo_path.clone(),
+                status: entry.status,
+                staging,
+            };
+
+            if staging.has_staged() {
+                staged_count += 1;
+                single_staged_entry = Some(entry.clone());
+            }
+
+            if group_by_status && is_conflict {
+                conflict_entries.push(entry);
+            } else if group_by_status && is_new {
+                new_entries.push(entry);
+            } else {
+                changed_entries.push(entry);
+            }
+        }
+
+        if conflict_entries.is_empty() {
+            if staged_count == 1
+                && let Some(entry) = single_staged_entry.as_ref()
+            {
+                if let Some(ops) = repo.pending_ops_for_path(&entry.repo_path) {
+                    if ops.staged() {
+                        self.single_staged_entry = single_staged_entry;
+                    }
+                } else {
+                    self.single_staged_entry = single_staged_entry;
+                }
+            } else if repo.pending_ops_summary().item_summary.staging_count == 1
+                && let Some(ops) = repo.pending_ops().find(|ops| ops.staging())
+            {
+                self.single_staged_entry =
+                    repo.status_for_path(&ops.repo_path)
+                        .map(|status| GitStatusEntry {
+                            repo_path: ops.repo_path.clone(),
+                            status: status.status,
+                            staging: StageStatus::Staged,
+                        });
+            }
+        }
+
+        if conflict_entries.is_empty() && changed_entries.len() == 1 {
+            self.single_tracked_entry = changed_entries.first().cloned();
+        }
+
+        [changed_entries, new_entries, conflict_entries]
     }
 
     fn header_state(&self, header_type: Section) -> ToggleState {
@@ -3882,6 +3960,9 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         self.active_repository.as_ref()?;
+        if self.tracked_commit_sha.is_some() {
+            return None;
+        }
 
         let (text, action, stage, tooltip) =
             if self.total_staged_count() == self.entry_count && self.entry_count > 0 {
@@ -3969,6 +4050,10 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
+        if self.tracked_commit_sha.is_some() {
+            return None;
+        }
+
         let active_repository = self.active_repository.clone()?;
         let panel_editor_style = panel_editor_style(true, window, cx);
         let enable_coauthors = self.render_co_authors(cx);
@@ -4362,7 +4447,7 @@ impl GitPanel {
 
     fn render_entries(
         &self,
-        has_write_access: bool,
+        staging_enabled: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -4399,7 +4484,7 @@ impl GitPanel {
                                                 ix,
                                                 entry,
                                                 0,
-                                                has_write_access,
+                                                staging_enabled,
                                                 window,
                                                 cx,
                                             ));
@@ -4409,7 +4494,7 @@ impl GitPanel {
                                                 ix,
                                                 &entry.entry,
                                                 entry.depth,
-                                                has_write_access,
+                                                staging_enabled,
                                                 window,
                                                 cx,
                                             ));
@@ -4418,7 +4503,7 @@ impl GitPanel {
                                             items.push(this.render_directory_entry(
                                                 ix,
                                                 entry,
-                                                has_write_access,
+                                                staging_enabled,
                                                 window,
                                                 cx,
                                             ));
@@ -4667,6 +4752,7 @@ impl GitPanel {
         let marked = self.marked_entries.contains(&ix);
         let status_style = GitPanelSettings::get_global(cx).status_style;
         let status = entry.status;
+        let show_staging_controls = self.tracked_commit_sha.is_none();
 
         let has_conflict = status.is_conflicted();
         let is_modified = status.is_modified();
@@ -4824,30 +4910,32 @@ impl GitPanel {
                 },
             )
             .child(name_row)
-            .child(
-                div()
-                    .id(checkbox_wrapper_id)
-                    .flex_none()
-                    .occlude()
-                    .cursor_pointer()
-                    .child(
-                        Checkbox::new(checkbox_id, is_staged)
-                            .disabled(!has_write_access)
-                            .fill()
-                            .elevation(ElevationIndex::Surface)
-                            .on_click_ext({
-                                let entry = entry.clone();
-                                let this = cx.weak_entity();
-                                move |_, click, window, cx| {
-                                    this.update(cx, |this, cx| {
-                                        if !has_write_access {
-                                            return;
-                                        }
-                                        if click.modifiers().shift {
-                                            this.stage_bulk(ix, cx);
-                                        } else {
-                                            let list_entry =
-                                                if GitPanelSettings::get_global(cx).tree_view {
+            .when(show_staging_controls, |row| {
+                row.child(
+                    div()
+                        .id(checkbox_wrapper_id)
+                        .flex_none()
+                        .occlude()
+                        .cursor_pointer()
+                        .child(
+                            Checkbox::new(checkbox_id, is_staged)
+                                .disabled(!has_write_access)
+                                .fill()
+                                .elevation(ElevationIndex::Surface)
+                                .on_click_ext({
+                                    let entry = entry.clone();
+                                    let this = cx.weak_entity();
+                                    move |_, click, window, cx| {
+                                        this.update(cx, |this, cx| {
+                                            if !has_write_access {
+                                                return;
+                                            }
+                                            if click.modifiers().shift {
+                                                this.stage_bulk(ix, cx);
+                                            } else {
+                                                let list_entry = if GitPanelSettings::get_global(cx)
+                                                    .tree_view
+                                                {
                                                     GitListEntry::TreeStatus(GitTreeStatusEntry {
                                                         entry: entry.clone(),
                                                         depth,
@@ -4855,27 +4943,32 @@ impl GitPanel {
                                                 } else {
                                                     GitListEntry::Status(entry.clone())
                                                 };
-                                            this.toggle_staged_for_entry(&list_entry, window, cx);
-                                        }
-                                        cx.stop_propagation();
-                                    })
-                                    .ok();
-                                }
-                            })
-                            .tooltip(move |_window, cx| {
-                                // If is_staging_or_staged is None, this implies the file was partially staged, and so
-                                // we allow the user to stage it in full by displaying `Stage` in the tooltip.
-                                let action = if is_staging_or_staged {
-                                    "Unstage"
-                                } else {
-                                    "Stage"
-                                };
-                                let tooltip_name = action.to_string();
+                                                this.toggle_staged_for_entry(
+                                                    &list_entry,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                            cx.stop_propagation();
+                                        })
+                                        .ok();
+                                    }
+                                })
+                                .tooltip(move |_window, cx| {
+                                    // If is_staging_or_staged is None, this implies the file was partially staged, and so
+                                    // we allow the user to stage it in full by displaying `Stage` in the tooltip.
+                                    let action = if is_staging_or_staged {
+                                        "Unstage"
+                                    } else {
+                                        "Stage"
+                                    };
+                                    let tooltip_name = action.to_string();
 
-                                Tooltip::for_action(tooltip_name, &ToggleStaged, cx)
-                            }),
-                    ),
-            )
+                                    Tooltip::for_action(tooltip_name, &ToggleStaged, cx)
+                                }),
+                        ),
+                )
+            })
             .into_any_element()
     }
 
@@ -4929,6 +5022,7 @@ impl GitPanel {
             IconName::Folder
         };
         let staged_state = entry.staged_state;
+        let show_staging_controls = self.tracked_commit_sha.is_none();
 
         let name_row = h_flex()
             .items_center()
@@ -4966,45 +5060,47 @@ impl GitPanel {
                 })
             })
             .child(name_row)
-            .child(
-                div()
-                    .id(checkbox_wrapper_id)
-                    .flex_none()
-                    .occlude()
-                    .cursor_pointer()
-                    .child(
-                        Checkbox::new(checkbox_id, staged_state)
-                            .disabled(!has_write_access)
-                            .fill()
-                            .elevation(ElevationIndex::Surface)
-                            .on_click({
-                                let entry = entry.clone();
-                                let this = cx.weak_entity();
-                                move |_, window, cx| {
-                                    this.update(cx, |this, cx| {
-                                        if !has_write_access {
-                                            return;
-                                        }
-                                        this.toggle_staged_for_entry(
-                                            &GitListEntry::Directory(entry.clone()),
-                                            window,
-                                            cx,
-                                        );
-                                        cx.stop_propagation();
-                                    })
-                                    .ok();
-                                }
-                            })
-                            .tooltip(move |_window, cx| {
-                                let action = if staged_state.selected() {
-                                    "Unstage"
-                                } else {
-                                    "Stage"
-                                };
-                                Tooltip::simple(format!("{action} folder"), cx)
-                            }),
-                    ),
-            )
+            .when(show_staging_controls, |row| {
+                row.child(
+                    div()
+                        .id(checkbox_wrapper_id)
+                        .flex_none()
+                        .occlude()
+                        .cursor_pointer()
+                        .child(
+                            Checkbox::new(checkbox_id, staged_state)
+                                .disabled(!has_write_access)
+                                .fill()
+                                .elevation(ElevationIndex::Surface)
+                                .on_click({
+                                    let entry = entry.clone();
+                                    let this = cx.weak_entity();
+                                    move |_, window, cx| {
+                                        this.update(cx, |this, cx| {
+                                            if !has_write_access {
+                                                return;
+                                            }
+                                            this.toggle_staged_for_entry(
+                                                &GitListEntry::Directory(entry.clone()),
+                                                window,
+                                                cx,
+                                            );
+                                            cx.stop_propagation();
+                                        })
+                                        .ok();
+                                    }
+                                })
+                                .tooltip(move |_window, cx| {
+                                    let action = if staged_state.selected() {
+                                        "Unstage"
+                                    } else {
+                                        "Stage"
+                                    };
+                                    Tooltip::simple(format!("{action} folder"), cx)
+                                }),
+                        ),
+                )
+            })
             .into_any_element()
     }
 
@@ -5199,6 +5295,8 @@ impl Render for GitPanel {
             .and_then(|workspace| workspace.read(cx).active_call()?.read(cx).room().cloned());
 
         let has_write_access = self.has_write_access(cx);
+        let staging_enabled =
+            self.tracked_commit_sha.is_none() && has_write_access && !project.is_read_only(cx);
 
         let has_co_authors = room.is_some_and(|room| {
             self.load_local_committer(cx);
@@ -5212,7 +5310,7 @@ impl Render for GitPanel {
             .id("git_panel")
             .key_context(self.dispatch_context(window, cx))
             .track_focus(&self.focus_handle)
-            .when(has_write_access && !project.is_read_only(cx), |this| {
+            .when(staging_enabled, |this| {
                 this.on_action(cx.listener(Self::toggle_staged_for_selected))
                     .on_action(cx.listener(Self::stage_range))
                     .on_action(cx.listener(GitPanel::commit))
@@ -5255,7 +5353,7 @@ impl Render for GitPanel {
                     .children(self.render_panel_header(window, cx))
                     .map(|this| {
                         if has_entries {
-                            this.child(self.render_entries(has_write_access, window, cx))
+                            this.child(self.render_entries(staging_enabled, window, cx))
                         } else {
                             this.child(self.render_empty_state(cx).into_any_element())
                         }

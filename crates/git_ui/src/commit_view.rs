@@ -3,6 +3,7 @@ use buffer_diff::{BufferDiff, BufferDiffSnapshot};
 use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle};
 use editor::{Editor, EditorEvent, ExcerptRange, MultiBuffer, multibuffer_context_lines};
 use git::repository::{CommitDetails, CommitDiff, RepoPath};
+use git::status::{FileStatus, StatusCode, TrackedStatus};
 use git::{GitHostingProviderRegistry, GitRemote, parse_git_remote_url};
 use gpui::{
     AnyElement, App, AppContext as _, Asset, AsyncApp, AsyncWindowContext, Context, Element,
@@ -14,6 +15,7 @@ use language::{
     Point, ReplicaId, Rope, TextBuffer,
 };
 use multi_buffer::PathKey;
+use project::git_store::StatusEntry;
 use project::{Project, WorktreeId, git_store::Repository};
 use std::{
     any::{Any, TypeId},
@@ -53,11 +55,12 @@ pub fn init(cx: &mut App) {
 }
 
 pub struct CommitView {
-    commit: CommitDetails,
+    pub commit: CommitDetails,
     editor: Entity<Editor>,
     stash: Option<usize>,
     multibuffer: Entity<MultiBuffer>,
     repository: Entity<Repository>,
+    statuses_by_path: Arc<Box<[StatusEntry]>>,
     remote: Option<GitRemote>,
 }
 
@@ -72,6 +75,37 @@ const COMMIT_MESSAGE_SORT_PREFIX: u64 = 0;
 const FILE_NAMESPACE_SORT_PREFIX: u64 = 1;
 
 impl CommitView {
+    pub fn commit_sha(&self) -> &str {
+        &self.commit.sha
+    }
+
+    pub fn cached_status(&self) -> impl Iterator<Item = StatusEntry> + '_ {
+        self.statuses_by_path.iter().cloned()
+    }
+
+    pub fn focus_repo_path(
+        &mut self,
+        repo_path: &RepoPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let key = PathKey::with_sort_prefix(FILE_NAMESPACE_SORT_PREFIX, repo_path.as_ref().clone());
+        let Some(anchor) = self.multibuffer.read(cx).location_for_path(&key, cx) else {
+            return false;
+        };
+
+        self.editor.update(cx, |editor, cx| {
+            editor.change_selections(
+                editor::SelectionEffects::scroll(editor::scroll::Autoscroll::fit()),
+                window,
+                cx,
+                |sels| sels.select_ranges([anchor..anchor]),
+            );
+            editor.focus_handle(cx).focus(window);
+        });
+        true
+    }
+
     pub fn open(
         commit_sha: String,
         repo: WeakEntity<Repository>,
@@ -144,6 +178,20 @@ impl CommitView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let statuses_by_path = Arc::new(
+            commit_diff
+                .files
+                .iter()
+                .map(|file| StatusEntry {
+                    repo_path: file.path.clone(),
+                    status: FileStatus::Tracked(TrackedStatus {
+                        index_status: StatusCode::Modified,
+                        worktree_status: StatusCode::Unmodified,
+                    }),
+                })
+                .collect(),
+        );
+
         let language_registry = project.read(cx).languages().clone();
         let multibuffer = cx.new(|_| MultiBuffer::new(Capability::ReadOnly));
 
@@ -306,6 +354,7 @@ impl CommitView {
             multibuffer,
             stash,
             repository,
+            statuses_by_path,
             remote,
         }
     }
@@ -1007,6 +1056,7 @@ impl Item for CommitView {
                 commit: self.commit.clone(),
                 stash: self.stash,
                 repository: self.repository.clone(),
+                statuses_by_path: self.statuses_by_path.clone(),
                 remote: self.remote.clone(),
             }
         })))
